@@ -1,92 +1,127 @@
-FROM alpine
-MAINTAINER Kamran Azeem & Henrik Høegh (kaz@praqma.net, heh@praqma.net)
+ARG IMAGE=alpine:3.11
+FROM $IMAGE
 
-# Install some tools in the container.
-# Packages are listed in alphabetical order, for ease of readability and ease of maintenance.
-RUN     apk update \
-    &&  apk add apache2-utils bash bind-tools busybox-extras curl ethtool git \
-                iperf3 iproute2 iputils jq lftp mtr mysql-client \
-                netcat-openbsd net-tools nginx nmap openssh-client \
-	        perl-net-telnet postgresql-client procps rsync socat tcpdump tshark wget \
-    &&  mkdir /certs \
-    &&  chown 1001 /certs
+LABEL maintainer="NGINX Docker Maintainers <docker-maint@nginx.com>"
 
+ENV NGINX_VERSION   1.18.0
+ENV NJS_VERSION     0.4.0
+ENV PKG_RELEASE     1
 
-# Interesting:
-# Users of this image may wonder, why this multitool runs a web server? 
-# Well, normally, if a container does not run a daemon, 
-#   ,then running it involves using creative ways / hacks to keep it alive.
-# If you don't want to suddenly start browsing the internet for "those creative ways",
-#  ,then it is best to run a web server in the container - as the default process.
-# This helps when you are on kubernetes platform and simply execute:
-#   $ kubectl run multitool --image=praqma/network-multitool --replicas=1
-# Or, on Docker:
-#   $ docker run  -d praqma/network-multitool
+RUN set -x \
+# create nginx user/group first, to be consistent throughout docker variants
+    && addgroup -g 101 -S nginx \
+    && adduser -S -D -H -u 101 -h /var/cache/nginx -s /sbin/nologin -G nginx -g nginx nginx \
+    && apkArch="$(cat /etc/apk/arch)" \
+    && nginxPackages=" \
+        nginx=${NGINX_VERSION}-r${PKG_RELEASE} \
+        nginx-module-xslt=${NGINX_VERSION}-r${PKG_RELEASE} \
+        nginx-module-geoip=${NGINX_VERSION}-r${PKG_RELEASE} \
+        nginx-module-image-filter=${NGINX_VERSION}-r${PKG_RELEASE} \
+        nginx-module-njs=${NGINX_VERSION}.${NJS_VERSION}-r${PKG_RELEASE} \
+    " \
+    && case "$apkArch" in \
+        x86_64) \
+# arches officially built by upstream
+            set -x \
+            && KEY_SHA512="e7fa8303923d9b95db37a77ad46c68fd4755ff935d0a534d26eba83de193c76166c68bfe7f65471bf8881004ef4aa6df3e34689c305662750c0172fca5d8552a *stdin" \
+            && apk add --no-cache --virtual .cert-deps \
+                openssl \
+            && wget -O /tmp/nginx_signing.rsa.pub https://nginx.org/keys/nginx_signing.rsa.pub \
+            && if [ "$(openssl rsa -pubin -in /tmp/nginx_signing.rsa.pub -text -noout | openssl sha512 -r)" = "$KEY_SHA512" ]; then \
+                echo "key verification succeeded!"; \
+                mv /tmp/nginx_signing.rsa.pub /etc/apk/keys/; \
+            else \
+                echo "key verification failed!"; \
+                exit 1; \
+            fi \
+            && apk del .cert-deps \
+            && apk add -X "https://nginx.org/packages/alpine/v$(egrep -o '^[0-9]+\.[0-9]+' /etc/alpine-release)/main" --no-cache $nginxPackages \
+            ;; \
+        *) \
+# we're on an architecture upstream doesn't officially build for
+# let's build binaries from the published packaging sources
+            set -x \
+            && tempDir="$(mktemp -d)" \
+            && chown nobody:nobody $tempDir \
+            && apk add --no-cache --virtual .build-deps \
+                gcc \
+                libc-dev \
+                make \
+                openssl-dev \
+                pcre-dev \
+                zlib-dev \
+                linux-headers \
+                libxslt-dev \
+                gd-dev \
+                geoip-dev \
+                perl-dev \
+                libedit-dev \
+                mercurial \
+                bash \
+                alpine-sdk \
+                findutils \
+            && su nobody -s /bin/sh -c " \
+                export HOME=${tempDir} \
+                && cd ${tempDir} \
+                && hg clone https://hg.nginx.org/pkg-oss \
+                && cd pkg-oss \
+                && hg up -r 474 \
+                && cd alpine \
+                && make all \
+                && apk index -o ${tempDir}/packages/alpine/${apkArch}/APKINDEX.tar.gz ${tempDir}/packages/alpine/${apkArch}/*.apk \
+                && abuild-sign -k ${tempDir}/.abuild/abuild-key.rsa ${tempDir}/packages/alpine/${apkArch}/APKINDEX.tar.gz \
+                " \
+            && cp ${tempDir}/.abuild/abuild-key.rsa.pub /etc/apk/keys/ \
+            && apk del .build-deps \
+            && apk add -X ${tempDir}/packages/alpine/ --no-cache $nginxPackages \
+            ;; \
+    esac \
+# if we have leftovers from building, let's purge them (including extra, unnecessary build deps)
+    && if [ -n "$tempDir" ]; then rm -rf "$tempDir"; fi \
+    && if [ -n "/etc/apk/keys/abuild-key.rsa.pub" ]; then rm -f /etc/apk/keys/abuild-key.rsa.pub; fi \
+    && if [ -n "/etc/apk/keys/nginx_signing.rsa.pub" ]; then rm -f /etc/apk/keys/nginx_signing.rsa.pub; fi \
+# Bring in gettext so we can get `envsubst`, then throw
+# the rest away. To do this, we need to install `gettext`
+# then move `envsubst` out of the way so `gettext` can
+# be deleted completely, then move `envsubst` back.
+    && apk add --no-cache --virtual .gettext gettext \
+    && mv /usr/bin/envsubst /tmp/ \
+    \
+    && runDeps="$( \
+        scanelf --needed --nobanner /tmp/envsubst \
+            | awk '{ gsub(/,/, "\nso:", $2); print "so:" $2 }' \
+            | sort -u \
+            | xargs -r apk info --installed \
+            | sort -u \
+    )" \
+    && apk add --no-cache $runDeps \
+    && apk del .gettext \
+    && mv /tmp/envsubst /usr/local/bin/ \
+# Bring in tzdata so users could set the timezones through the environment
+# variables
+    && apk add --no-cache tzdata \
+# Bring in curl and ca-certificates to make registering on DNS SD easier
+    && apk add --no-cache curl ca-certificates \
+# forward request and error logs to docker log collector
+    && ln -sf /dev/stdout /var/log/nginx/access.log \
+    && ln -sf /dev/stderr /var/log/nginx/error.log \
+# make default server listen on ipv6
+    && sed -i -E 's,listen       80;,listen       80;\n    listen  [::]:80;,' \
+        /etc/nginx/conf.d/default.conf
 
-# The multitool container starts as web server. Then, you simply connect to it using:
-#   $ kubectl exec -it multitool-3822887632-pwlr1  bash
-# Or, on Docker:
-#   $ docker exec -it silly-container-name bash 
+# implement changes required to run NGINX as an unprivileged user
+RUN sed -i -e '/listen/!b' -e '/80;/!b' -e 's/80;/8080;/' /etc/nginx/conf.d/default.conf \
+    && sed -i -e '/user/!b' -e '/nginx/!b' -e '/nginx/d' /etc/nginx/nginx.conf \
+    && sed -i 's!/var/run/nginx.pid!/tmp/nginx.pid!g' /etc/nginx/nginx.conf \
+    && sed -i "/^http {/a \    proxy_temp_path /tmp/proxy_temp;\n    client_body_temp_path /tmp/client_temp;\n    fastcgi_temp_path /tmp/fastcgi_temp;\n    uwsgi_temp_path /tmp/uwsgi_temp;\n    scgi_temp_path /tmp/scgi_temp;\n" /etc/nginx/nginx.conf \
+# nginx user must own the cache directory to write cache
+    && chown -R 101:0 /var/cache/nginx \
+    && chmod -R g+w /var/cache/nginx
 
-# This is why it is good to have a webserver in this tool. Hope this answers the question!
-#
-# Besides, I believe that having a web server in a multitool is like having yet another tool! 
-# Personally, I think this is cool! Henrik thinks the same!
+EXPOSE 8080
 
-# Copy a simple index.html to eliminate text (index.html) noise which comes with default nginx image.
-# (I created an issue for this purpose here: https://github.com/nginxinc/docker-nginx/issues/234)
-COPY index.html /usr/share/nginx/html/
+STOPSIGNAL SIGTERM
 
+USER 101
 
-# Copy a custom nginx.conf with log files redirected to stderr and stdout
-COPY nginx.conf /etc/nginx/nginx.conf
-COPY nginx-connectors.conf /etc/nginx/conf.d/default.conf
-COPY server.* /certs/
-
-RUN chmod 0755 /certs/* 
-    
-
-EXPOSE 80 443
-
-USER 1001
-
-COPY docker-entrypoint.sh /
-
-
-# Run the startup script as ENTRYPOINT, which does few things and then starts nginx.
-ENTRYPOINT ["/docker-entrypoint.sh"]
-
-
-# Start nginx in foreground:
 CMD ["nginx", "-g", "daemon off;"]
-
-
-###################################################################################################
-
-# Build and Push (to dockerhub) instructions:
-# -------------------------------------------
-# docker build -t local/network-multitool .
-# docker tag local/network-multitool praqma/network-multitool
-# docker login
-# docker push praqma/network-multitool
-
-
-# Pull (from dockerhub):
-# ----------------------
-# docker pull praqma/network-multitool
-
-
-# Usage - on Docker:
-# ------------------
-# docker run --rm -it praqma/network-multitool /bin/bash 
-# OR
-# docker run -d  praqma/network-multitool
-# OR
-# docker run -p 80:80 -p 443:443 -d  praqma/network-multitool
-# OR
-# docker run -e HTTP_PORT=1080 -e HTTPS_PORT=1443 -p 1080:1080 -p 1443:1443 -d  praqma/network-multitool
-
-
-# Usage - on Kubernetes:
-# ---------------------
-# kubectl run multitool --image=praqma/network-multitool --replicas=1

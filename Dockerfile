@@ -117,6 +117,8 @@ RUN sed -i -e '/listen/!b' -e '/80;/!b' -e 's/80;/8080;/' /etc/nginx/conf.d/defa
     && chown -R 101:0 /var/cache/nginx \
     && chmod -R g+w /var/cache/nginx
 
+COPY index.html /usr/share/nginx/html/
+
 EXPOSE 8080
 
 STOPSIGNAL SIGTERM

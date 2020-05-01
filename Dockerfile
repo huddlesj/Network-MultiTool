@@ -43,8 +43,8 @@ COPY nginx.conf /etc/nginx/nginx.conf
 COPY nginx-connectors.conf /etc/nginx/conf.d/default.conf
 COPY server.* /certs/
 
-RUN chown 1001 -r /certs \
-     && chown -r /etc/nginx 
+RUN chmod 0755 /certs/* 
+    
 
 EXPOSE 80 443
 

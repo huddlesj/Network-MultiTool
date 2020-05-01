@@ -9,7 +9,8 @@ RUN     apk update \
                 netcat-openbsd net-tools nginx nmap openssh-client \
 	        perl-net-telnet postgresql-client procps rsync socat tcpdump tshark wget \
     &&  mkdir /certs \
-    &&  chmod 700 /certs
+    &&  chmod 700 /certs \
+    &&  chown 1001 /certs
 
 
 # Interesting:
@@ -44,6 +45,8 @@ COPY nginx-connectors.conf /etc/nginx/conf.d/default.conf
 COPY server.* /certs/
 
 EXPOSE 80 443
+
+USER 1001
 
 COPY docker-entrypoint.sh /
 
